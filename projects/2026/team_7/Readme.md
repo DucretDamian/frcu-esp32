@@ -149,3 +149,63 @@ The system features three drawing modes from the web interface:
 1. **Analog joystick (Manual control):** To enable freehand movement by reading voltage variations, without requiring precalculated G-Code.
 2. **Interrupt button (Abort drawing):** A physical push button with hardware interrupts for instant emergency stop.
 3. **Limit switches (Endstops):** Mechanical switches at the ends of the X and Y axes to enable homing and mechanical self-calibration at system startup.
+
+## 🔄 Stage 2 – Improvement
+- **Team number:** 15
+- **Members:**
+  - Oviedo Francisco
+  - Martinez Felipe
+  - Muller Nicolás
+  - Milano Mateo
+  - Corazzini Matías
+
+### 🚀 Improvement Description
+- **What was improved:**
+We implemented a physical pause/resume button with hardware debouncing that halts execution, saves current coordinates, and de-energizes the stepper coils to prevent overheating. This directly fulfills Improvement #2 proposed in Stage 1. Additionally, we integrated an interactive freehand vector drawing canvas in the web UI that simplifies strokes and compiles them directly into streamed G-Code for plotting.
+- **Why:**
+Previously, halting execution relied entirely on the web interface over Wi-Fi. In the event of network latency, browser disconnects, or mechanical hazards (such as pen snagging or paper misalignment), the user had no immediate way to halt the machine other than cutting power; that is why we implemented a dedicated physical button that halts execution while preserving coordinate state.
+Regarding the drawing canvas, traditional plotter workflows depend heavily on external CAM software to generate G-Code files. We introduced this feature to eliminate that dependency, allowing users to sketch directly in the browser and stream custom vector paths to the robot with zero setup.
+
+### 🔩 Component Changes
+| Change | Component             | Quantity | Notes                                                           |
+| ------ | --------------------- | -------- | --------------------------------------------------------------- |
+| Added  | Momentary Push Button | 1        | Hardware pause/resume button.                                   |
+| Added  | Jumper Wires          | 2        | Connections between the push button and the ESP32 / breadboard. |
+
+
+### 🛠️ Updated Usage Instructions
+
+#### 1. Hardware Connection (Button)
+- Connect one terminal of the push button to **GPIO 27** (`EMERGENCY_STOP_PIN`).
+- Connect the opposite terminal to a common **GND** rail. 
+- No external pull-up resistor is needed: the firmware configures `pinMode(EMERGENCY_STOP_PIN, INPUT_PULLUP)` internally.
+
+#### 2. Firmware Flashing
+- Open `CodigoESP32.ino` in the Arduino IDE.
+- Ensure the required libraries are installed (`AccelStepper`, `WebSocketsServer`, `ArduinoJson`, `Preferences`).
+- Select your ESP32 Dev Module board, compile, and upload.
+
+#### 3. New "Paint" Tab (Freehand Vector Drawing)
+- Open `cnc-plotter-web-1.html` in any web browser and connect via WebSocket (`ws://192.168.4.1:81/`).
+- Navigate to the **"Paint"** tab.
+- **Deferred Mode (Recommended):** Ensure *Real-time send* is unchecked. Draw your design freely using mouse or touch input. The UI applies Douglas-Peucker point reduction. Click **"▶ Send All to Robot"** to compile into G-Code and stream the path with automatic ACK flow control.
+- **Real-Time Mode:** Check *Real-time send* to have the robot replicate each stroke live as the pointer moves across the screen.
+
+#### 4. Hardware Pause/Resume Operation
+- Press the physical button once during plotting: execution freezes immediately, current coordinates are saved to non-volatile storage (NVS), and stepper coils are de-energized to avoid thermal dissipation.
+- Press the button a second time: stepper coils re-energize and the machine resumes its job from the exact halted position.
+
+### 🧪 Updated Simulation
+- **Wokwi project link:** Same as Stage 1 (Validated directly on physical hardware due to electromechanical tolerances, torque calibration, and 3D-printed assembly dynamics).
+- **Diagram/export files:** See `docs/` folder for Stage 1 wiring diagrams; Stage 2 button connection uses GPIO 27 to GND.
+
+### 📝 Additional Notes
+
+#### Challenges Faced & Technical Decisions
+- **Interrupt Debouncing in RAM:** Implemented a 250 ms time gate inside the interrupt service routine (`IRAM_ATTR buttonISR()`) to filter mechanical bounce without introducing blocking delays into the ESP32 CPU.
+- **Thermal Management:** Unipolar 28BYJ-48 stepper motors with ULN2003 drivers generate severe heat when held stationary in `FULL4WIRE` mode. Invoking `disableOutputs()` during pauses completely cuts coil current during idle states.
+- **Client-Side Curve Optimization:** Drawing on a canvas emits hundreds of raw pointer events per second. We integrated the **Douglas-Peucker algorithm** ($\epsilon = 0.4\text{ mm}$) in the browser to eliminate redundant co-linear points before G-Code compilation, protecting the ESP32's 8-element queue (`cmdQueue`) from buffer overflows.
+
+#### Remaining Limitations
+- **Stepping Loop Constraints:** Stepper stepping is polled in `loop()` alongside WebSocket processing; plotting speeds are clamped (`MAX_STEP_RATE_SPS = 400`) to prevent packet handling jitter.
+- **Open-Loop Mechanical Bounds:** The machine still relies on software limits (`clampTravel()`) and manual zeroing (`set_zero`), as physical limit switches (endstops) have not yet been incorporated.
