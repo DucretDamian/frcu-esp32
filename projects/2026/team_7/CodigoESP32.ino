@@ -1,8 +1,7 @@
 /*
   ESP32 — Single-Board Plotter Controller (WebSocket + X/Y/Z stepper motors)
-  Adaptado para 3 motores 28BYJ-48 en modo FULL4WIRE.
+  Adaptado para 3 motores 28BYJ-48 en modo FULL4WIRE con Botón de Pausa/Reanudación.
 */
-
 #include <WiFi.h>
 #include <WebSocketsServer.h>
 #include <ArduinoJson.h>
@@ -35,14 +34,16 @@ WebSocketsServer webSocket(WS_PORT);
 #define Y_IN3 17
 #define Y_IN4 18
 
-// Eje Z (Nuevo)
+// Eje Z
 #define Z_IN1 32
 #define Z_IN2 19
 #define Z_IN3 22
 #define Z_IN4 23
 
+// Pin para Botón (Pausa / Reanudación / Emergencia)
+#define EMERGENCY_STOP_PIN 27
+
 // Inicialización de motores (FULL4WIRE para máxima fuerza)
-// Orden intercalado: IN1, IN3, IN2, IN4
 AccelStepper stepperX(AccelStepper::FULL4WIRE, X_IN1, X_IN3, X_IN2, X_IN4);
 AccelStepper stepperY(AccelStepper::FULL4WIRE, Y_IN1, Y_IN3, Y_IN2, Y_IN4);
 AccelStepper stepperZ(AccelStepper::FULL4WIRE, Z_IN1, Z_IN3, Z_IN2, Z_IN4);
@@ -50,8 +51,8 @@ MultiStepper steppersXY;
 
 // ---------- Altura del Eje Z (en mm) ----------
 #define PEN_UP_Z_MM    0.0
-#define PEN_DOWN_Z_MM 5.0
-#define Z_SPEED_STEPS_PER_SEC 400  // Máximo seguro para el 28BYJ-48
+#define PEN_DOWN_Z_MM  5.0
+#define Z_SPEED_STEPS_PER_SEC 400
 #define Z_ACCEL_STEPS_PER_SEC2 300
 
 // ---------- Calibración ----------
@@ -60,6 +61,19 @@ bool  invertZ = false;
 float defaultFeedrateMmMin = 250;
 float rapidFeedrateMmMin   = 600;
 bool  isPaused = false;
+
+// ---------- Control del Botón Físico ----------
+volatile bool buttonTriggered = false;
+volatile unsigned long lastButtonPress = 0;
+
+// Rutina de servicio de interrupción (ISR en RAM) con antirrebote de 250ms
+void IRAM_ATTR buttonISR() {
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastButtonPress > 250) {
+    buttonTriggered = true;
+    lastButtonPress = currentMillis;
+  }
+}
 
 // ---------- Almacenamiento persistente (NVS) ----------
 Preferences prefs;
@@ -71,8 +85,28 @@ std::deque<String> cmdQueue;
 bool xyMoving = false;
 bool zMoving = false;
 
+// Prototipos de funciones
+void pauseSystem();
+void resumeSystem();
+void serviceSteppers();
+void serviceQueue();
+void savePositionThrottled(bool force);
+void webSocketEvent(uint8_t clientId, WStype_t type, uint8_t* payload, size_t length);
+void sendStatus(const char* status, const String& message);
+void processCommand(const String& raw);
+void handleGcodeLine(String line);
+void startLinearMove(float xMm, float yMm, bool rapid);
+void startZMove(float zMm);
+float currentXmm();
+float currentYmm();
+float currentZmm();
+
 void setup() {
   Serial.begin(115200);
+
+  // Configuración del botón con pull-up e interrupción
+  pinMode(EMERGENCY_STOP_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(EMERGENCY_STOP_PIN), buttonISR, FALLING);
 
   prefs.begin("cncplotter", false);
   long savedX = prefs.getLong("posX", 0);
@@ -110,11 +144,60 @@ void setup() {
 }
 
 void loop() {
+  // Manejo de la acción del botón físico
+  if (buttonTriggered) {
+    buttonTriggered = false;
+    if (isPaused) {
+      resumeSystem();
+    } else {
+      pauseSystem();
+    }
+  }
+
   webSocket.loop();
   serviceSteppers();     
   serviceQueue();        
   savePositionThrottled(false);  
-  delay(1);               
+  delay(1);                
+}
+
+void pauseSystem() {
+  // 1. Detener inmediatamente el avance lógico de todos los ejes
+  stepperX.moveTo(stepperX.currentPosition());
+  stepperY.moveTo(stepperY.currentPosition());
+  stepperZ.moveTo(stepperZ.currentPosition());
+  xyMoving = false;
+  zMoving = false;
+
+  // Opcional: Si quieres que el botón borre el trabajo por completo (Parada de Emergencia total), 
+  // descomenta la siguiente línea. Si prefieres que funcione como una simple Pausa, déjala comentada.
+  // cmdQueue.clear();
+
+  // 2. Marcar como pausado
+  isPaused = true;
+
+  // 3. Guardar posición actual
+  savePositionThrottled(true);
+
+  // 4. Apagar las bobinas para evitar recalentamiento
+  stepperX.disableOutputs();
+  stepperY.disableOutputs();
+  stepperZ.disableOutputs();
+
+  Serial.println("[ALERTA] Sistema Pausado.");
+  sendStatus("error", "system_paused");
+}
+
+void resumeSystem() {
+  isPaused = false;
+  
+  // Volver a energizar las bobinas de los motores
+  stepperX.enableOutputs();
+  stepperY.enableOutputs();
+  stepperZ.enableOutputs();
+
+  Serial.println("[INFO] Sistema Reanudado.");
+  sendStatus("ok", "system_resumed");
 }
 
 #define POSITION_SAVE_INTERVAL_MS 3000
@@ -152,9 +235,16 @@ void webSocketEvent(uint8_t clientId, WStype_t type, uint8_t* payload, size_t le
     StaticJsonDocument<200> peek;
     if (deserializeJson(peek, msg) == DeserializationError::Ok) {
       const char* cmd = peek["cmd"] | "";
+      
+      // Control de pausa desde web
       if (strcmp(cmd, "pause") == 0) {
-        isPaused = !isPaused;
-        sendStatus("ok", isPaused ? "paused" : "resumed");
+        if (isPaused) resumeSystem();
+        else pauseSystem();
+        return;
+      }
+      if (strcmp(cmd, "stop") == 0) {
+        pauseSystem();
+        cmdQueue.clear(); // El botón "Stop" de la web sí cancela definitivamente
         return;
       }
       if (strcmp(cmd, "status") == 0) {
@@ -162,6 +252,7 @@ void webSocketEvent(uint8_t clientId, WStype_t type, uint8_t* payload, size_t le
         return;
       }
     }
+    
     cmdQueue.push_back(msg);
     const size_t MAX_QUEUE = 8;
     while (cmdQueue.size() > MAX_QUEUE) {
@@ -182,7 +273,7 @@ void serviceSteppers() {
   }
   
   if (zMoving) {
-    stepperZ.run(); // Ahora ejecuta el motor Z real
+    stepperZ.run();
     if (stepperZ.distanceToGo() == 0) {
       zMoving = false;
       sendStatus("ok", "pen_moved");  
